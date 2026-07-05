@@ -1,0 +1,391 @@
+#!/bin/bash
+# ccrelay - Claudeの5時間レート制限ウィンドウをまたいでセッションを自動リレーするラッパー
+# 使い方は `ccrelay --help` を参照。
+
+set -uo pipefail
+
+# === 設定（環境変数で上書き可）===
+CCRELAY_HOME="${CCRELAY_HOME:-$HOME/.claude/ccrelay}"
+CLAUDE_BIN="${CCRELAY_CLAUDE_BIN:-claude}"
+IDLE_SEC="${CCRELAY_IDLE_SEC:-300}"
+USED_THRESHOLD="${CCRELAY_USED_THRESHOLD:-90}"
+POLL_SEC="${CCRELAY_POLL_SEC:-30}"
+GRACE_SEC="${CCRELAY_GRACE_SEC:-5}"
+RESUME_MESSAGE="${CCRELAY_RESUME_MESSAGE:-Continue the work if you can. If you are waiting for the user to respond (e.g. a task is complete, or you are waiting for an answer to a question), say nothing except [[PAUSED]].}"
+SETTINGS_FILE="${CCRELAY_SETTINGS:-$HOME/.claude/settings.json}"
+
+WINDOWS_DIR="$CCRELAY_HOME/windows"
+STATE_DIR="$CCRELAY_HOME/state"
+HOOK_SCRIPT="$CCRELAY_HOME/statusline-hook.sh"
+
+now() { date +%s; }
+log() { printf '[ccrelay %s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+
+usage() {
+    cat <<'USAGE'
+使い方:
+  ccrelay [-r|--resume ID] [claudeに渡す引数...]
+      セッションを起動し、5時間枠をまたいで自動リレーする。
+      -r/--resume は claude本体の同名オプションを横取りし、指定したsession-idをそのまま採用する
+      （省略時は新規UUIDを採番する）。
+
+  ccrelay install      statuslineフックを導入する
+  ccrelay uninstall    statuslineフックを解除する
+  ccrelay status       既知セッションの枠状態を表示する
+  ccrelay -h, --help   この使い方を表示する
+
+例:
+  ccrelay                                          新規セッションを起動
+  ccrelay --model opus                             claude本体への引数もそのまま渡せる
+  ccrelay -r 80f26c29-91b6-496c-acc3-53c0aa6ac453   既存セッションに後から被せて監視する
+
+詳しくは README.md / DESIGN.md を参照してください。
+USAGE
+}
+
+# === stat/date のGNU(Linux)、BSD(macOS)両対応 ===
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+epoch_to_date() { date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2" 2>/dev/null; }
+
+# === transcriptパスの特定 ===
+# statuslineフックが書いた値を優先し、無ければsession-idでファイルを探す。
+transcript_for_sid() {
+    local sid="$1" win="$WINDOWS_DIR/$sid.json" tr=""
+    [ -f "$win" ] && tr="$(jq -r '.transcript // empty' "$win" 2>/dev/null)"
+    if [ -z "$tr" ] || [ ! -f "$tr" ]; then
+        tr="$(find "$HOME/.claude/projects" -maxdepth 2 -name "$sid.jsonl" 2>/dev/null | head -1)"
+    fi
+    printf '%s' "$tr"
+}
+
+# === 一時停止マーカーの検出 ===
+# タスク完了、質問への回答待ちなど、ユーザーの発言がないと先に進めない状態を指す。
+is_paused() {
+    local tr="$1"
+    [ -n "$tr" ] && [ -f "$tr" ] || return 1
+    jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$tr" 2>/dev/null \
+        | tail -3 | grep -q '\[\[PAUSED\]\]'
+}
+
+# === リレー判定（純関数、テスト対象）===
+# windows/<sid>.json と transcript を見て、いま再開すべきか判定する。
+should_relay() {
+    local win="$1" tr="$2"
+    [ -f "$win" ] || return 1
+
+    local r5 used5 t
+    r5="$(jq -r '.r5 // empty' "$win" 2>/dev/null)"
+    used5="$(jq -r '.used5 // empty' "$win" 2>/dev/null)"
+    t="$(now)"
+
+    # 1. 新しい枠が開いているか（記録した枠がリセット済みか）
+    [ -n "$r5" ] && [ "$r5" != "null" ] && [ "$r5" -eq "$r5" ] 2>/dev/null || return 1
+    [ "$t" -gt "$r5" ] || return 1
+
+    # 2. 使用量ガード: 直前枠がほぼ枯渇していたか
+    [ -n "$used5" ] && [ "$used5" != "null" ] || return 1
+    awk "BEGIN{exit !($used5 >= $USED_THRESHOLD)}" || return 1
+
+    # 3. アイドルか（transcriptが一定時間更新されていない）
+    [ -n "$tr" ] && [ -f "$tr" ] || return 1
+    local mtime idle
+    mtime="$(file_mtime "$tr")" || return 1
+    idle=$((t - mtime))
+    [ "$idle" -ge "$IDLE_SEC" ] || return 1
+
+    # 4. 一時停止していないか（タスク完了、質問への回答待ちなど）
+    is_paused "$tr" && return 1
+
+    return 0
+}
+
+# === ウォッチャ: 別プロセスとして起動し、再開タイミングを監視する ===
+watch_session() {
+    local sid="$1"
+    local win="$WINDOWS_DIR/$sid.json"
+    local relay_flag="$STATE_DIR/$sid/relay"
+    local paused_flag="$STATE_DIR/$sid/paused"
+    local pid_file="$STATE_DIR/$sid/pid"
+    while true; do
+        local cpid
+        cpid="$(cat "$pid_file" 2>/dev/null)"
+        if [ -z "$cpid" ] || ! kill -0 "$cpid" 2>/dev/null; then
+            sleep "$POLL_SEC"; continue
+        fi
+        if [ -f "$win" ]; then
+            local tr
+            tr="$(transcript_for_sid "$sid")"
+            if is_paused "$tr"; then
+                log "[[PAUSED]] を検出しました。監視を停止します。"
+                touch "$paused_flag"
+                return
+            fi
+            if should_relay "$win" "$tr"; then
+                log "自動再開条件を満たしました。$CLAUDE_BIN(pid=$cpid)を終了して再開します。"
+                touch "$relay_flag"
+                kill -TERM "$cpid" 2>/dev/null
+                local waited=0
+                while kill -0 "$cpid" 2>/dev/null && [ "$waited" -lt "$GRACE_SEC" ]; do
+                    sleep 1; waited=$((waited + 1))
+                done
+                kill -KILL "$cpid" 2>/dev/null
+                return
+            fi
+        fi
+        sleep "$POLL_SEC"
+    done
+}
+
+# === session-id を解決する（-r/--resume指定時はそのIDを採用、省略時は新規UUID）===
+resolve_sid() {
+    local explicit_sid="${1:-}"
+    if [ -n "$explicit_sid" ]; then
+        sid="$explicit_sid"
+        is_new=0
+    else
+        sid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr 'A-Z' 'a-z')"
+        is_new=1
+    fi
+}
+
+# === リレーのメインループ ===
+run_relay() {
+    local resume_arg="$1"; shift
+    is_installed || { log "ccrelayがインストールされていません。'ccrelay install' でインストールしてください。"; exit 1; }
+    resolve_sid "$resume_arg"
+    mkdir -p "$WINDOWS_DIR" "$STATE_DIR/$sid"
+    log "session-id=$sid"
+    [ "$is_new" = 1 ] && log "新規セッション。再開するには次回 ccrelay --resume $sid を実行してください。"
+
+    local first="$is_new"
+    # 自動継続メッセージは「枠またぎリレーで人間不在のまま再開した」ときだけ送る。
+    # 手動での初回起動、再アタッチ（-r/--resume 指定時）では人間が最初の発言をするため送らない。
+    local relay_triggered=0
+    local win="$WINDOWS_DIR/$sid.json"
+    local relay_flag="$STATE_DIR/$sid/relay"
+    local paused_flag="$STATE_DIR/$sid/paused"
+    local pid_file="$STATE_DIR/$sid/pid"
+
+    while true; do
+        rm -f "$win" "$relay_flag" "$paused_flag" "$pid_file"
+
+        watch_session "$sid" &
+        local watcher=$!
+
+        if [ "$first" = 1 ]; then
+            log "claude起動 (新規): $CLAUDE_BIN --session-id $sid $*"
+            "$CLAUDE_BIN" --session-id "$sid" "$@" &
+        elif [ "$relay_triggered" = 1 ]; then
+            log "claude再開 (自動リレー): $CLAUDE_BIN --resume $sid \"<再開メッセージ>\""
+            "$CLAUDE_BIN" --resume "$sid" "$RESUME_MESSAGE" &
+        else
+            log "claude再開: $CLAUDE_BIN --resume $sid"
+            "$CLAUDE_BIN" --resume "$sid" &
+        fi
+        local claude_pid=$!
+        echo "$claude_pid" > "$pid_file"
+        first=0
+
+        wait "$claude_pid"
+        local rc=$?
+
+        kill "$watcher" 2>/dev/null
+        wait "$watcher" 2>/dev/null
+
+        if [ -f "$relay_flag" ]; then
+            # 新しい枠は既に開いているので、待たずにそのまま再開する
+            log "新しい枠でセッションを再開します。"
+            relay_triggered=1
+            continue
+        fi
+
+        if [ -f "$paused_flag" ]; then
+            log "一時停止マーカーを検出済み。ccrelayを終了します。"
+        else
+            log "claudeが終了しました (return $rc)。ccrelayを終了します。"
+        fi
+        break
+    done
+}
+
+# HOOK_PREFIX: 元コマンドをprintf %qでクォートした1引数を続ける前置き（末尾スペース込み）。
+# uninstall時の前方一致判定にも使う。
+HOOK_PREFIX="bash $HOOK_SCRIPT "
+
+# === statuslineフックが導入済みか判定する ===
+is_installed() {
+    [ -f "$SETTINGS_FILE" ] || return 1
+    local cur
+    cur="$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE" 2>/dev/null)"
+    case "$cur" in
+        "$HOOK_PREFIX"*) return 0 ;;
+        *)                return 1 ;;
+    esac
+}
+
+# === 変更内容を提示してY/n確認する。Enter/yで続行、それ以外は中止 ===
+confirm_or_abort() {
+    printf 'よろしいですか？(Y/n): ' >&2
+    local reply
+    if ! read -r reply; then
+        log "入力を取得できませんでした。中止します。"
+        exit 1
+    fi
+    case "$reply" in
+        ""|[Yy]*) return 0 ;;
+        *)         log "中止しました。"; exit 1 ;;
+    esac
+}
+
+# settings.jsonを触る直前に必ず呼ぶ。タイムスタンプ付きスナップショットを残す。
+backup_settings() {
+    [ -f "$SETTINGS_FILE" ] || return 0
+    local backup="$SETTINGS_FILE.ccrelay-$(date '+%Y%m%d-%H%M%S').bak"
+    cp "$SETTINGS_FILE" "$backup" && log "settings.jsonをバックアップしました: $backup"
+}
+
+# ラップ済みcommandから元コマンドを取り出す（printf %qの出力は単一シェル語なのでevalで安全に復元できる）。
+unwrap_statusline_command() {
+    local cmd="$1"
+    case "$cmd" in
+        "$HOOK_PREFIX"*) eval "printf '%s' ${cmd#"$HOOK_PREFIX"}" ;;
+        *)               printf '%s' "$cmd" ;;
+    esac
+}
+
+do_install() {
+    [ -f "$SETTINGS_FILE" ] || { log "settings.jsonが見つかりません: $SETTINGS_FILE"; exit 1; }
+
+    # 前回のラップを剥がして真の元コマンドを得てから再ラップする（二重ラップ防止）。
+    local cur orig wrapped
+    cur="$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE")"
+    orig="$(unwrap_statusline_command "$cur")"
+    wrapped="$HOOK_PREFIX$(printf %q "$orig")"
+
+    {
+        echo "ccrelay インストール"
+        echo "- ステータスラインフック $HOOK_SCRIPT を作成します。"
+        echo "- $SETTINGS_FILE の statusLine.command を書き換えます。"
+        echo "    変更前: ${cur:-（未設定）}"
+        echo "    変更後: $wrapped"
+    } >&2
+    confirm_or_abort
+
+    mkdir -p "$CCRELAY_HOME"
+    cat > "$HOOK_SCRIPT" <<'HOOK'
+#!/bin/bash
+# ccrelay statuslineフック: stdinのJSONから必要な値を windows/<sid>.json に書き出し、
+# 第1引数で渡された元のstatuslineコマンドにstdinを丸ごと委譲する。
+input=$(cat)
+home="${CCRELAY_HOME:-$HOME/.claude/ccrelay}"
+mkdir -p "$home/windows" 2>/dev/null
+sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+if [ -n "$sid" ]; then
+    printf '%s' "$input" | jq -c '{
+        sid: .session_id,
+        r5: .rate_limits.five_hour.resets_at,
+        r7: .rate_limits.seven_day.resets_at,
+        used5: .rate_limits.five_hour.used_percentage,
+        transcript: .transcript_path,
+        cwd: .cwd
+    }' > "$home/windows/$sid.json" 2>/dev/null
+fi
+# 元コマンド（第1引数）が空でなければ、そのままシェルで実行しstdinを委譲する。
+[ -n "$1" ] && exec bash -c "$1" <<< "$input"
+HOOK
+    chmod +x "$HOOK_SCRIPT"
+
+    backup_settings
+    local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/ccrelay-settings.XXXXXXXX")"
+    jq --arg cmd "$wrapped" '.statusLine = {type:"command", command:$cmd}' "$SETTINGS_FILE" > "$tmp" && mv "$tmp" "$SETTINGS_FILE"
+    if [ -n "$orig" ]; then
+        log "フックを導入しました。元のstatuslineコマンドを引き続き呼びます: $orig"
+    else
+        log "フックを導入しました（元のstatuslineコマンドは未設定）。"
+    fi
+}
+
+do_uninstall() {
+    [ -f "$SETTINGS_FILE" ] || { log "settings.jsonが見つかりません: $SETTINGS_FILE"; exit 1; }
+
+    local cur orig hook_installed=0
+    cur="$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE")"
+    case "$cur" in
+        "$HOOK_PREFIX"*) orig="$(unwrap_statusline_command "$cur")"; hook_installed=1 ;;
+    esac
+
+    if [ "$hook_installed" = 0 ] && [ ! -d "$CCRELAY_HOME" ]; then
+        log "ccrelayのフックも状態も見つかりませんでした。何もしません。"
+        return
+    fi
+
+    {
+        echo "ccrelay アンインストール"
+        [ -d "$CCRELAY_HOME" ] && echo "- $CCRELAY_HOME を削除します。"
+        if [ "$hook_installed" = 1 ]; then
+            echo "- $SETTINGS_FILE の statusLine.command を書き換えます。"
+            echo "    変更前: $cur"
+            echo "    変更後: ${orig:-（statusLineごと削除）}"
+        fi
+    } >&2
+    confirm_or_abort
+
+    if [ "$hook_installed" = 1 ]; then
+        backup_settings
+        local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/ccrelay-settings.XXXXXXXX")"
+        if [ -n "$orig" ]; then
+            jq --arg cmd "$orig" '.statusLine = {type:"command", command:$cmd}' "$SETTINGS_FILE" > "$tmp" && mv "$tmp" "$SETTINGS_FILE"
+            log "statusLineフックを解除し、元のコマンドに戻しました: $orig"
+        else
+            jq 'del(.statusLine)' "$SETTINGS_FILE" > "$tmp" && mv "$tmp" "$SETTINGS_FILE"
+            log "statusLineフックを解除しました（元のstatuslineは未設定だったため削除）。"
+        fi
+    else
+        log "ccrelayのフックは見つかりませんでした。settings.jsonは変更していません。"
+    fi
+
+    if [ -d "$CCRELAY_HOME" ]; then
+        rm -rf "$CCRELAY_HOME"
+        log "$CCRELAY_HOME を削除しました。"
+    fi
+}
+
+do_status() {
+    echo "windows:"
+    for f in "$WINDOWS_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        local r5 used5 when="?"
+        r5="$(jq -r '.r5 // "?"' "$f")"; used5="$(jq -r '.used5 // "?"' "$f")"
+        [ "$r5" != "?" ] && [ "$r5" != "null" ] && when="$(epoch_to_date "$r5" '+%m/%d %H:%M')"
+        echo "  $(basename "$f" .json): 5h使用 ${used5}% / リセット ${when}"
+    done
+}
+
+# === エントリポイント ===
+main() {
+    case "${1:-}" in
+        -h|--help) usage; exit 0 ;;
+        install)   do_install; exit 0 ;;
+        uninstall) do_uninstall; exit 0 ;;
+        status)    do_status; exit 0 ;;
+        # テスト用内部サブコマンド
+        __should_relay) shift; should_relay "$1" "$2"; exit $? ;;
+        __is_paused)    shift; is_paused "$1"; exit $? ;;
+        __resolve_sid)  shift; resolve_sid "${1:-}"; echo "sid=$sid is_new=$is_new"; exit 0 ;;
+        __is_installed) is_installed; exit $? ;;
+    esac
+
+    local resume_arg="" args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -r|--resume)  [ $# -ge 2 ] || { log "-r/--resume には値が必要です"; usage >&2; exit 1; }
+                          resume_arg="$2"; shift 2 ;;
+            --resume=*)   resume_arg="${1#*=}"; shift ;;
+            *)            args+=("$1"); shift ;;
+        esac
+    done
+
+    run_relay "$resume_arg" "${args[@]}"
+}
+
+main "$@"
